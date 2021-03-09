@@ -19,6 +19,7 @@ import org.springframework.data.domain.Sort.by
 import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Isolation.REPEATABLE_READ
 import org.springframework.transaction.annotation.Transactional
+import java.time.Instant
 
 @Service
 class SquadMemberHistoryService(
@@ -86,6 +87,136 @@ class SquadMemberHistoryService(
             }
         }
 
+    @Transactional
+    fun getSquadHistoriesAndDurations(squads: List<Squad>): List<Pair<Squad, List<Pair<Int, List<Member>>>>> {
+        val squadHistoriesList: List<List<SquadMemberHistory>> = squads.map {
+            squadHistoryRepository.findAllBySquad(it, by(Sort.Direction.ASC, SquadMemberHistory::createDate.name))
+        }
+
+        val squadsAndDurations = squadHistoriesList.map {
+            it.foldRight(listOf()) { record: SquadMemberHistory, accumulator: List<Pair<Instant, List<Member>>> ->
+                when (accumulator.size) {
+                    0 ->
+                        accumulator
+                            .plusElement(
+                                Pair(
+                                    record.createDate,
+                                    listOf(memberRepository.findById(record.member.id).get())
+                                )
+                            )
+                    else ->
+                        accumulator
+                            .dropLastIf(accumulator.size != record.revisionNumber)
+                            .plusElement(
+                                Pair(
+                                    record.createDate,
+                                    when (record.revisionType) {
+                                        ADD -> accumulator.last().second.plus(
+                                            listOf(
+                                                memberRepository.findById(record.member.id).get()
+                                            )
+                                        )
+                                        REMOVE -> accumulator.last().second.minus(record.member)
+                                    }
+                                )
+                            )
+                }
+            }
+        }.map {
+            var lastRecord = it[0]
+            it.foldRight(listOf()) { current: Pair<Instant, List<Member>>, accumulator: List<Pair<Int, List<Member>>> ->
+                if (lastRecord != current)
+                    accumulator.plusElement(
+                        Pair(
+                            timestampDifferenceInDays(lastRecord.first, current.first),
+                            lastRecord.second
+                        )
+                    )
+                if (accumulator.size == it.size - 1)
+                    accumulator.plusElement(
+                        Pair(
+                            timestampDifferenceInDays(current.first, Instant.now()),
+                            current.second
+                        )
+                    )
+                lastRecord = current
+                accumulator
+            }
+        }
+        return squads.mapIndexed { index, squad -> Pair(squad, squadsAndDurations[index]) }
+    }
+
+    private fun calculateMemberPairingPoints(squadsAndDurations: List<Pair<Int, List<Member>>>): HashMap<Pair<Member, Member>, Int> {
+        val mppMap = HashMap<Pair<Member, Member>, Int>()
+
+        squadsAndDurations.map {
+            it.second
+        }.flatten().distinct().apply {
+            this.forEachIndexed { index, member ->
+                if (index + 1 < this.size) {
+                    this.subList(index + 1, this.size).forEach { subMember ->
+                        mppMap[Pair(member, subMember)] = 0
+                        mppMap[Pair(subMember, member)] = 0
+                    }
+                }
+            }
+        }
+
+        squadsAndDurations.forEach {
+            val time = it.first
+            val members = it.second
+
+            members.forEachIndexed { index, member ->
+                if (index + 1 < members.size) {
+                    members.subList(index + 1, members.size).forEach { subMember ->
+                        mppMap[Pair(member, subMember)]?.plus(time)!!
+                        mppMap[Pair(subMember, member)]?.plus(time)!!
+                    }
+                }
+            }
+        }
+        return mppMap
+    }
+
+    private fun calculateSquadPairingPoints(squadConfigurationsAndDurations: List<Pair<Squad, List<Pair<Int, List<Member>>>>>): HashMap<Pair<Squad, Member>, Int> {
+        val sppMap = HashMap<Pair<Squad, Member>, Int>()
+        val squads = squadConfigurationsAndDurations.map { it.first }
+        val members =
+            squadConfigurationsAndDurations.asSequence().map { it.second }.flatten().map { it.second }.flatten().distinct()
+                .toList()
+
+        squads.forEach { squad ->
+            members.forEach { member ->
+                sppMap[Pair(squad, member)] = 0
+            }
+        }
+
+        squadConfigurationsAndDurations.forEach { configurations ->
+            val squad = configurations.first
+            val configurationInstance = configurations.second
+            configurationInstance.forEach { configuration ->
+                val duration = configuration.first
+                configuration.second.forEach { member ->
+                    sppMap[Pair(squad, member)]?.plus(duration)
+                }
+            }
+        }
+
+        return sppMap
+    }
+
+    private fun timestampDifferenceInDays(start: Instant, end: Instant): Int {
+        val millisToDays = 1000 * 60 * 60 * 24
+        return (start.minusMillis(end.toEpochMilli()).toEpochMilli() / millisToDays).toInt()
+    }
+
+    fun getMPPAndSPP(squads: List<Squad>): Pair<HashMap<Pair<Member, Member>, Int>, HashMap<Pair<Squad, Member>, Int>> {
+        val squadConfigurationsAndDurations = getSquadHistoriesAndDurations(squads)
+        val sppMap = calculateSquadPairingPoints(squadConfigurationsAndDurations)
+        val mppMap = calculateMemberPairingPoints(squadConfigurationsAndDurations.map { it.second }.flatten())
+        return Pair(mppMap, sppMap)
+    }
+
     @Transactional(isolation = REPEATABLE_READ)
     fun concentrateSquadRevisionsTo(squad: Squad, revisionNumber: Int): List<Member> = squadHistoryRepository
         .findAllBySquadAndRevisionNumberAfter(squad, revisionNumber)
@@ -125,7 +256,7 @@ class SquadMemberHistoryService(
             }
         }.toMutableList()
 
-    private fun List<List<Member>>.dropLastIf(predicate: Boolean): List<List<Member>> =
+    private fun <T> List<T>.dropLastIf(predicate: Boolean): List<T> =
         if (predicate) this.dropLast(1) else this
 
     private fun <T> Page<T>.orElseThrow(exception: () -> Nothing): Page<T> = when {
